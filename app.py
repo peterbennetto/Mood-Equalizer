@@ -4,8 +4,9 @@ Draws the sliders, the gauge and the reflection line.
 Scoring lives in mood_logic.py, lines in responses.py and API calls
 in api_client.py.
 
-Session only: slider values, feedback and sidebar settings are held in
-memory. Nothing is written to disk, and no API key is ever saved.
+Session only: slider values, feedback, token counts and sidebar
+settings are held in memory. Nothing is written to disk, and no API
+key is ever saved.
 """
 
 import html
@@ -37,9 +38,11 @@ from mood_logic import (
 st.set_page_config(page_title="Mood Equalizer", page_icon="\u2696", layout="centered")
 
 # --- Styling -----------------------------------------------------------
-# Hides the raw slider numbers. This relies on Streamlit's internal
-# data-testid names, so it is best-effort. Several possible names are
-# listed because they differ between Streamlit versions.
+# Hides the raw numbers on the mood sliders. This relies on Streamlit's
+# internal data-testid names, so it is best-effort. Several possible
+# names are listed because they differ between Streamlit versions.
+# The last two rules put the numbers back inside the sidebar, so the
+# temperature slider stays readable.
 
 CSS = """
 <style>
@@ -54,6 +57,18 @@ CSS = """
 [data-testid="stSliderTickBarMin"],
 [data-testid="stSliderTickBarMax"] {
     display: none !important;
+}
+[data-testid="stSidebar"] [data-testid="stSliderThumbValue"],
+[data-testid="stSidebar"] [data-testid="stThumbValue"] {
+    visibility: visible !important;
+}
+[data-testid="stSidebar"] [data-testid="stTickBar"],
+[data-testid="stSidebar"] [data-testid="stSliderTickBar"],
+[data-testid="stSidebar"] [data-testid="stTickBarMin"],
+[data-testid="stSidebar"] [data-testid="stTickBarMax"],
+[data-testid="stSidebar"] [data-testid="stSliderTickBarMin"],
+[data-testid="stSidebar"] [data-testid="stSliderTickBarMax"] {
+    display: flex !important;
 }
 .mood-strip {
     height: 5px;
@@ -188,7 +203,70 @@ def sidebar_overrides(base):
     host = st.sidebar.text_input(
         "Ollama host", key="ov_host", placeholder=DEFAULT_OLLAMA_HOST
     )
-    return {"provider": provider, "api_key": api_key, "model": model, "host": host}
+
+    # Temperature: only used by AI providers, so it is greyed out for "none".
+    st.sidebar.divider()
+    ai_active = target != "none"
+    temperature = st.sidebar.slider(
+        "Temperature",
+        min_value=0.0,
+        max_value=1.0,
+        value=round(float(base["temperature"]), 1),
+        step=0.1,
+        key="ov_temp",
+        disabled=not ai_active,
+        help="Low is steady and repeatable. High is more varied wording.",
+    )
+    if ai_active:
+        st.sidebar.caption(
+            f"Temperature now: {temperature:.1f}. Low is steady, high is more varied."
+        )
+    else:
+        st.sidebar.caption("Temperature only applies to Anthropic, OpenAI and Ollama.")
+
+    return {
+        "provider": provider,
+        "api_key": api_key,
+        "model": model,
+        "host": host,
+        "temperature": temperature if ai_active else None,
+    }
+
+
+# --- Token counter (session only) --------------------------------------
+
+def record_tokens(result):
+    """Add one reflection's token usage to the session totals."""
+    state = st.session_state
+    state["tokens_last"] = (result.input_tokens, result.output_tokens)
+    state["tokens_in_total"] = state.get("tokens_in_total", 0) + result.input_tokens
+    state["tokens_out_total"] = state.get("tokens_out_total", 0) + result.output_tokens
+
+
+def render_token_counter(slot):
+    """Fill the sidebar placeholder with the last and total token counts."""
+    state = st.session_state
+    last = state.get("tokens_last")
+    total_in = state.get("tokens_in_total", 0)
+    total_out = state.get("tokens_out_total", 0)
+
+    with slot.container():
+        st.divider()
+        st.markdown("**Tokens (this session)**")
+        if last is None:
+            st.caption("No clicks yet.")
+        elif last == (0, 0):
+            st.caption("Last click: 0 (no AI tokens used).")
+        else:
+            st.caption(f"Last click: {last[0]} sent, {last[1]} received.")
+        st.caption(
+            f"Total: {total_in} sent, {total_out} received, "
+            f"{total_in + total_out} overall."
+        )
+        st.caption(
+            "Counts come from the provider's reply. Pre-written lines count as 0. "
+            "A failed call may show 0 even if the provider billed it."
+        )
 
 
 # --- Feedback ----------------------------------------------------------
@@ -221,6 +299,10 @@ def main():
     if not ready:
         st.sidebar.warning(status_message)
 
+    # Reserve the counter's spot now. It is filled after the button is
+    # handled, so the numbers are up to date on the same click.
+    counter_slot = st.sidebar.empty()
+
     # The gauge sits above the sliders but needs their values,
     # so reserve its spot now and fill it in afterwards.
     gauge_slot = st.empty()
@@ -239,6 +321,7 @@ def main():
             result = generate_reflection(
                 band, direction, values, settings, avoid=previous
             )
+        record_tokens(result)
         st.session_state["reflection"] = {
             "text": result.text,
             "source": result.source,
@@ -247,6 +330,8 @@ def main():
             "snapshot": snapshot,
         }
         st.session_state["feedback_done"] = None
+
+    render_token_counter(counter_slot)
 
     reflection = st.session_state.get("reflection")
     # Only show the line while the sliders still match the reading it was for.

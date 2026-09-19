@@ -6,6 +6,7 @@ pre-written bank. Any failure falls back to the bank.
 Privacy: only the band, the direction and word-only slider positions
 are sent. No numbers, no personal text.
 Secrets: keys are only read, never written to disk or logged.
+Token counts come from the provider's own reply. Nothing is stored here.
 No Streamlit code here.
 """
 
@@ -54,9 +55,11 @@ SYSTEM_PROMPT = (
 
 class Reflection(NamedTuple):
     """Result of a reflection request."""
-    text: str      # The line to show
-    source: str    # anthropic, openai, ollama or bank
-    note: str      # Empty, or a short reason a fallback was used
+    text: str               # The line to show
+    source: str             # anthropic, openai, ollama or bank
+    note: str               # Empty, or a short reason a fallback was used
+    input_tokens: int = 0   # Tokens sent to the provider (0 for the bank)
+    output_tokens: int = 0  # Tokens received from the provider
 
 
 # --- Settings ----------------------------------------------------------
@@ -68,6 +71,14 @@ def _to_float(value, default, low, high):
     except (TypeError, ValueError):
         return default
     return max(low, min(high, number))
+
+
+def _to_int(value):
+    """Convert to a whole number of 0 or more. Anything odd becomes 0."""
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _clean_key(value):
@@ -139,6 +150,12 @@ def apply_overrides(settings, overrides):
         result[f"{target}_model"] = model
     if host and target == "ollama":
         result["ollama_host"] = host
+
+    # Temperature: None or an invalid value keeps the .env setting.
+    temperature = overrides.get("temperature")
+    if temperature is not None:
+        result["temperature"] = _to_float(
+            temperature, result["temperature"], 0.0, 1.0)
     return result
 
 
@@ -196,8 +213,29 @@ def clean_text(raw):
     return text
 
 
+# --- Token usage -------------------------------------------------------
+# Each helper returns (tokens_sent, tokens_received). Missing data is 0.
+
+def _anthropic_usage(response):
+    usage = getattr(response, "usage", None)
+    return (_to_int(getattr(usage, "input_tokens", 0)),
+            _to_int(getattr(usage, "output_tokens", 0)))
+
+
+def _openai_usage(response):
+    usage = getattr(response, "usage", None)
+    return (_to_int(getattr(usage, "prompt_tokens", 0)),
+            _to_int(getattr(usage, "completion_tokens", 0)))
+
+
+def _ollama_usage(data):
+    return (_to_int(data.get("prompt_eval_count")),
+            _to_int(data.get("eval_count")))
+
+
 # --- Provider calls ----------------------------------------------------
-# Each returns raw text or raises. generate_reflection catches everything.
+# Each returns (text, tokens_sent, tokens_received) or raises.
+# generate_reflection catches everything.
 
 def _call_anthropic(settings, user_message):
     import anthropic
@@ -213,10 +251,12 @@ def _call_anthropic(settings, user_message):
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_message}],
     )
-    return "".join(
+    text = "".join(
         block.text for block in response.content
         if getattr(block, "type", "") == "text"
     )
+    tokens_in, tokens_out = _anthropic_usage(response)
+    return text, tokens_in, tokens_out
 
 
 def _call_openai(settings, user_message):
@@ -235,7 +275,9 @@ def _call_openai(settings, user_message):
         temperature=settings["temperature"],
         max_tokens=MAX_TOKENS,
     )
-    return response.choices[0].message.content or ""
+    text = response.choices[0].message.content or ""
+    tokens_in, tokens_out = _openai_usage(response)
+    return text, tokens_in, tokens_out
 
 
 def _call_ollama(settings, user_message):
@@ -259,7 +301,10 @@ def _call_ollama(settings, user_message):
         timeout=settings["timeout"],
     )
     response.raise_for_status()
-    return response.json().get("message", {}).get("content", "")
+    data = response.json()
+    text = data.get("message", {}).get("content", "")
+    tokens_in, tokens_out = _ollama_usage(data)
+    return text, tokens_in, tokens_out
 
 
 # --- Main entry point --------------------------------------------------
@@ -275,24 +320,28 @@ def generate_reflection(band, direction, values, settings, avoid=None):
     if not ready:
         return Reflection(get_response(band, avoid), "bank", message)
 
+    # Set before the call so a rejected reply still reports its usage.
+    tokens_in = 0
+    tokens_out = 0
     try:
         user_message = build_user_message(band, direction, values)
         if provider == "anthropic":
-            raw = _call_anthropic(settings, user_message)
+            raw, tokens_in, tokens_out = _call_anthropic(settings, user_message)
         elif provider == "openai":
-            raw = _call_openai(settings, user_message)
+            raw, tokens_in, tokens_out = _call_openai(settings, user_message)
         else:
-            raw = _call_ollama(settings, user_message)
+            raw, tokens_in, tokens_out = _call_ollama(settings, user_message)
 
         text = clean_text(raw)
         if text is None:
             raise ValueError("unusable reply")
-        return Reflection(text, provider, "")
+        return Reflection(text, provider, "", tokens_in, tokens_out)
     except Exception as exc:  # Deliberately broad: any failure falls back
         # Only the error type is shown. Never the message or the key.
         note = (f"{provider} call failed ({type(exc).__name__}). "
                 "Showing a pre-written line.")
-        return Reflection(get_response(band, avoid), "bank", note)
+        return Reflection(get_response(band, avoid), "bank", note,
+                          tokens_in, tokens_out)
 
 
 # --- Self-check --------------------------------------------------------
@@ -301,6 +350,8 @@ def generate_reflection(band, direction, values, settings, avoid=None):
 
 def _run_checks():
     import sys
+    from types import SimpleNamespace
+
     from mood_logic import default_values
     from responses import RESPONSE_BANK
 
@@ -311,6 +362,7 @@ def _run_checks():
     settings = load_settings(env={})
     assert settings["provider"] == "none"
     assert settings["ollama_model"] == "qwen3:4b"
+    assert settings["temperature"] == DEFAULT_TEMPERATURE
     assert load_settings(env={"MOOD_PROVIDER": "banana"})["provider"] == "none"
     env = {"MOOD_PROVIDER": "anthropic",
            "ANTHROPIC_API_KEY": "your-anthropic-key-here"}
@@ -318,6 +370,10 @@ def _run_checks():
     env = {"MOOD_TEMPERATURE": "9", "MOOD_TIMEOUT_SECONDS": "abc"}
     loaded = load_settings(env=env)
     assert loaded["temperature"] == 1.0 and loaded["timeout"] == DEFAULT_TIMEOUT
+
+    # Whole-number helper.
+    assert _to_int(None) == 0 and _to_int("abc") == 0 and _to_int(-5) == 0
+    assert _to_int(7) == 7 and _to_int(7.9) == 7 and _to_int("12") == 12
 
     # Overrides: applied to a copy, never to the environment.
     before = dict(os.environ)
@@ -330,6 +386,17 @@ def _run_checks():
     assert settings["provider"] == "none"          # original untouched
     assert dict(os.environ) == before              # environment untouched
     assert apply_overrides(settings, {"provider": ""})["provider"] == "none"
+
+    # Temperature override: applied, clamped, and ignored when blank or bad.
+    assert apply_overrides(settings, {"temperature": 0.2})["temperature"] == 0.2
+    assert apply_overrides(settings, {"temperature": 5})["temperature"] == 1.0
+    assert apply_overrides(settings, {"temperature": -1})["temperature"] == 0.0
+    assert apply_overrides(settings, {"temperature": None})["temperature"] \
+        == settings["temperature"]
+    assert apply_overrides(settings, {"temperature": "abc"})["temperature"] \
+        == settings["temperature"]
+    assert settings["temperature"] == DEFAULT_TEMPERATURE  # original untouched
+    assert dict(os.environ) == before
 
     # Status checks.
     assert provider_status(settings) == (True, "")
@@ -356,16 +423,29 @@ def _run_checks():
     assert clean_text("Slow down \u2014 breathe.") == "Slow down , breathe."
     assert clean_text("Line one.\n\nLine two.") == "Line one. Line two."
 
-    # Provider none: bank line, no note.
+    # Token usage helpers, with fake replies. Missing data gives 0.
+    fake = SimpleNamespace(usage=SimpleNamespace(input_tokens=12, output_tokens=7))
+    assert _anthropic_usage(fake) == (12, 7)
+    assert _anthropic_usage(SimpleNamespace()) == (0, 0)
+    fake = SimpleNamespace(
+        usage=SimpleNamespace(prompt_tokens=30, completion_tokens=9))
+    assert _openai_usage(fake) == (30, 9)
+    assert _openai_usage(SimpleNamespace(usage=None)) == (0, 0)
+    assert _ollama_usage({"prompt_eval_count": 40, "eval_count": 15}) == (40, 15)
+    assert _ollama_usage({}) == (0, 0)
+
+    # Provider none: bank line, no note, no tokens.
     result = generate_reflection("low", "lift", default_values(), settings)
     assert result.source == "bank" and result.note == ""
     assert result.text in RESPONSE_BANK["low"]
+    assert (result.input_tokens, result.output_tokens) == (0, 0)
 
-    # Missing key: falls back with a note.
+    # Missing key: falls back with a note and no tokens.
     result = generate_reflection(
         "high", "settle", default_values(), {**settings, "provider": "anthropic"})
     assert result.source == "bank" and result.note
     assert result.text in RESPONSE_BANK["high"]
+    assert (result.input_tokens, result.output_tokens) == (0, 0)
 
     # Mocked provider calls. Originals are restored afterwards.
     originals = (this._call_anthropic, this._call_openai, this._call_ollama)
@@ -373,10 +453,21 @@ def _run_checks():
         keyed = {**settings, "provider": "anthropic",
                  "anthropic_key": "sk-test-not-real"}
 
-        this._call_anthropic = lambda s, m: "A quiet minute helps."
-        result = generate_reflection("high", "settle", default_values(), keyed)
-        assert result.source == "anthropic" and result.text == "A quiet minute helps."
+        # Good reply: text and tokens come through. Temperature is passed on.
+        seen = {}
 
+        def fake_anthropic(s, m):
+            seen["temperature"] = s["temperature"]
+            return "A quiet minute helps.", 12, 7
+        this._call_anthropic = fake_anthropic
+        result = generate_reflection(
+            "high", "settle", default_values(), {**keyed, "temperature": 0.2})
+        assert result.source == "anthropic"
+        assert result.text == "A quiet minute helps."
+        assert (result.input_tokens, result.output_tokens) == (12, 7)
+        assert seen["temperature"] == 0.2
+
+        # Error: falls back, key never in the note, no tokens.
         def boom(s, m):
             raise RuntimeError("secret sk-test-not-real leaked?")
         this._call_anthropic = boom
@@ -384,30 +475,40 @@ def _run_checks():
         assert result.source == "bank" and result.text in bank_lines
         assert "sk-test" not in result.note     # key never in the note
         assert "RuntimeError" in result.note
+        assert (result.input_tokens, result.output_tokens) == (0, 0)
 
-        this._call_anthropic = lambda s, m: "Rest for 10 minutes."
+        # Digits in the reply: rejected, but the tokens were still used.
+        this._call_anthropic = lambda s, m: ("Rest for 10 minutes.", 20, 9)
         result = generate_reflection("high", "settle", default_values(), keyed)
-        assert result.source == "bank"          # digits rejected
+        assert result.source == "bank"
+        assert (result.input_tokens, result.output_tokens) == (20, 9)
 
-        this._call_anthropic = lambda s, m: ""
+        # Empty reply: rejected, tokens still counted.
+        this._call_anthropic = lambda s, m: ("", 15, 0)
         result = generate_reflection("high", "settle", default_values(), keyed)
-        assert result.source == "bank"          # empty rejected
+        assert result.source == "bank"
+        assert (result.input_tokens, result.output_tokens) == (15, 0)
 
-        this._call_openai = lambda s, m: "Something lovely is close by."
+        # OpenAI.
+        this._call_openai = lambda s, m: ("Something lovely is close by.", 30, 9)
         result = generate_reflection(
             "low", "lift", default_values(),
             {**settings, "provider": "openai", "openai_key": "sk-test-not-real"})
         assert result.source == "openai"
+        assert (result.input_tokens, result.output_tokens) == (30, 9)
 
-        seen = {}
+        # Ollama: reasoning text stripped, and /no_think added.
+        seen_message = {}
+
         def fake_ollama(s, m):
-            seen["message"] = m
-            return "<think>hm</think>Let things settle for a while."
+            seen_message["text"] = m
+            return "<think>hm</think>Let things settle for a while.", 40, 15
         this._call_ollama = fake_ollama
         result = generate_reflection(
             "high", "settle", default_values(), {**settings, "provider": "ollama"})
         assert result.source == "ollama"
         assert result.text == "Let things settle for a while."
+        assert (result.input_tokens, result.output_tokens) == (40, 15)
     finally:
         this._call_anthropic, this._call_openai, this._call_ollama = originals
 
@@ -416,6 +517,7 @@ def _run_checks():
                    "ollama_host": "http://127.0.0.1:9", "timeout": 3.0}
     result = generate_reflection("low", "lift", default_values(), unreachable)
     assert result.source == "bank" and result.note
+    assert (result.input_tokens, result.output_tokens) == (0, 0)
 
     print("All checks passed.")
 
