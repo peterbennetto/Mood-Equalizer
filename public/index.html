@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src data:; base-uri 'none'; form-action 'none'">
+  <title>Mood Equalizer</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%E2%9A%96%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <main>
+    <h1>Mood Equalizer</h1>
+    <p class="caption">You are at your best when centred.</p>
+    <p class="caption">Move the sliders to show where you are, and it will help you centre.</p>
+
+    <div id="gauge" role="img" aria-label="Gauge showing how far you are from the centre">
+      <div class="gauge-track">
+        <div class="gauge-fill" id="gauge-fill"></div>
+        <div class="gauge-centre"></div>
+        <div class="gauge-marker" id="gauge-marker"></div>
+      </div>
+      <div class="gauge-labels">
+        <span>Lower</span>
+        <span class="mid">Centred</span>
+        <span class="end">Higher</span>
+      </div>
+    </div>
+
+    <div id="sliders"></div>
+
+    <button id="equalize" class="primary" type="button">Mood Equalize</button>
+    <p id="status" class="caption" role="status"></p>
+
+    <section id="result" aria-live="polite" hidden>
+      <div class="reflection" id="reflection-text"></div>
+      <p class="caption" id="reflection-note"></p>
+      <div id="feedback">
+        <p class="caption" id="feedback-prompt">Was this helpful?</p>
+        <div class="thumbs" id="feedback-buttons">
+          <button type="button" class="thumb" id="fb-up" aria-label="Helpful">&#128077;</button>
+          <button type="button" class="thumb" id="fb-down" aria-label="Not helpful">&#128078;</button>
+        </div>
+        <p class="caption" id="feedback-thanks" hidden>Thanks for the feedback.</p>
+      </div>
+    </section>
+
+    <details class="settings">
+      <summary>Settings and tokens</summary>
+      <div class="settings-body">
+        <label for="temperature">Temperature: <output id="temperature-value">0.7</output></label>
+        <input type="range" id="temperature" min="0" max="1" step="0.1" value="0.7">
+        <p class="caption">Low is steady and repeatable. High is more varied wording. Only used when Gemini writes the line. Kept in this browser tab only.</p>
+
+        <h2>Tokens (this session)</h2>
+        <p class="caption" id="tokens-last">No clicks yet.</p>
+        <p class="caption" id="tokens-total">Total: 0 sent, 0 received, 0 overall.</p>
+        <p class="caption">Counts come from Gemini's reply. Pre-written lines count as 0. A failed call may show 0 even if Gemini counted it.</p>
+      </div>
+    </details>
+  </main>
+</body>
+</html>

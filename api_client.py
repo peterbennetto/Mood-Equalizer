@@ -1,38 +1,50 @@
 """Reflection line provider.
 
-Picks a reflection line from Anthropic, OpenAI or Ollama, or from the
-pre-written bank. Any failure falls back to the bank.
+Asks Google Gemini (free tier) for one short reflection line, or picks one
+from the pre-written bank. Any failure falls back to the bank.
 
 Privacy: only the band, the direction and word-only slider positions
-are sent. No numbers, no personal text.
-Secrets: keys are only read, never written to disk or logged.
-Token counts come from the provider's own reply. Nothing is stored here.
-No Streamlit code here.
+are sent to Gemini. No numbers, no personal text.
+Secrets: the key is only read from the environment. It is never written to
+disk, logged, or sent to the browser.
+Token counts come from Gemini's own reply. Nothing is stored here.
+Standard library only, so the Vercel function needs no packages.
+No web-page code here. api/reflect.py is the thin HTTP shell around
+handle_reflect().
 """
 
+import json
+import math
 import os
 import re
+import urllib.error
+import urllib.request
 from typing import NamedTuple
 
-from mood_logic import describe_positions
+from mood_logic import (
+    SLIDERS,
+    clamp,
+    compute_score,
+    describe_positions,
+    get_band,
+    get_direction,
+)
 from responses import get_response
 
 # --- Constants ---------------------------------------------------------
 
-PROVIDERS = ("none", "anthropic", "openai", "ollama")
-
-DEFAULT_MODELS = {
-    "anthropic": "claude-haiku-4-5-20251001",
-    "openai": "gpt-4o-mini",
-    "ollama": "qwen3:4b",
-}
-DEFAULT_OLLAMA_HOST = "http://localhost:11434"
+DEFAULT_MODEL = "gemini-3.5-flash-lite"
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 DEFAULT_TEMPERATURE = 0.7
 DEFAULT_TIMEOUT = 15.0
 
-MAX_TOKENS = 200        # Hard cap on reply length (cost control)
+# Thinking tokens count against this cap, so it is far above the roughly
+# 40 tokens the line itself needs. Length is enforced by MAX_LINE_CHARS.
+MAX_OUTPUT_TOKENS = 1024
 MAX_LINE_CHARS = 300    # Longer replies are rejected
 MIN_LINE_CHARS = 5
+MAX_AVOID_CHARS = 400   # Longest "previous line" the endpoint accepts
+MAX_BODY_BYTES = 2048   # Largest request the endpoint accepts
 
 SYSTEM_PROMPT = (
     "You write one short reflection line for a fun mood check-in app. "
@@ -56,10 +68,10 @@ SYSTEM_PROMPT = (
 class Reflection(NamedTuple):
     """Result of a reflection request."""
     text: str               # The line to show
-    source: str             # anthropic, openai, ollama or bank
+    source: str             # gemini or bank
     note: str               # Empty, or a short reason a fallback was used
-    input_tokens: int = 0   # Tokens sent to the provider (0 for the bank)
-    output_tokens: int = 0  # Tokens received from the provider
+    input_tokens: int = 0   # Tokens sent to Gemini (0 for the bank)
+    output_tokens: int = 0  # Tokens received from Gemini, thinking included
 
 
 # --- Settings ----------------------------------------------------------
@@ -69,6 +81,8 @@ def _to_float(value, default, low, high):
     try:
         number = float(value)
     except (TypeError, ValueError):
+        return default
+    if not math.isfinite(number):
         return default
     return max(low, min(high, number))
 
@@ -89,91 +103,33 @@ def _clean_key(value):
     return value
 
 
-def load_settings(env=None):
-    """Read settings from .env (via python-dotenv) and the environment.
+def _clean_model(value):
+    """Accept a plain model id (optionally 'models/...'). Else use the default."""
+    value = (value or "").strip()
+    if value.startswith("models/"):
+        value = value[len("models/"):]
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", value):
+        return DEFAULT_MODEL
+    return value
 
-    Pass `env` (a dict) to skip the file and environment, for testing.
+
+def load_settings(env=None):
+    """Read settings from the environment.
+
+    On Vercel these are Project Environment Variables. Locally,
+    dev_server.py copies .env into the environment first.
+    Pass `env` (a dict) to skip the real environment, for testing.
     """
     if env is None:
-        try:
-            from dotenv import load_dotenv
-            load_dotenv()  # Reads .env. Does not overwrite existing vars.
-        except ImportError:
-            pass  # Package not installed yet. Use the environment only.
         env = os.environ
-
-    provider = str(env.get("MOOD_PROVIDER", "none")).strip().lower()
-    if provider not in PROVIDERS:
-        provider = "none"
-
     return {
-        "provider": provider,
-        "anthropic_key": _clean_key(env.get("ANTHROPIC_API_KEY")),
-        "anthropic_model": (env.get("ANTHROPIC_MODEL")
-                            or DEFAULT_MODELS["anthropic"]).strip(),
-        "openai_key": _clean_key(env.get("OPENAI_API_KEY")),
-        "openai_model": (env.get("OPENAI_MODEL")
-                         or DEFAULT_MODELS["openai"]).strip(),
-        "ollama_host": (env.get("OLLAMA_HOST")
-                        or DEFAULT_OLLAMA_HOST).strip(),
-        "ollama_model": (env.get("OLLAMA_MODEL")
-                         or DEFAULT_MODELS["ollama"]).strip(),
+        "gemini_key": _clean_key(env.get("GEMINI_API_KEY")),
+        "model": _clean_model(env.get("GEMINI_MODEL")),
         "temperature": _to_float(env.get("MOOD_TEMPERATURE"),
                                  DEFAULT_TEMPERATURE, 0.0, 1.0),
         "timeout": _to_float(env.get("MOOD_TIMEOUT_SECONDS"),
-                             DEFAULT_TIMEOUT, 3.0, 120.0),
+                             DEFAULT_TIMEOUT, 3.0, 25.0),
     }
-
-
-def apply_overrides(settings, overrides):
-    """Return a copy of settings with sidebar overrides applied.
-
-    Session only. Nothing is written to .env, a file, or os.environ.
-    Empty values mean "keep what .env says".
-    """
-    result = dict(settings)
-    if not overrides:
-        return result
-
-    provider = str(overrides.get("provider") or "").strip().lower()
-    if provider in PROVIDERS:
-        result["provider"] = provider
-    target = result["provider"]
-
-    key = str(overrides.get("api_key") or "").strip()
-    model = str(overrides.get("model") or "").strip()
-    host = str(overrides.get("host") or "").strip()
-
-    if key and target in ("anthropic", "openai"):
-        result[f"{target}_key"] = key
-    if model and target != "none":
-        result[f"{target}_model"] = model
-    if host and target == "ollama":
-        result["ollama_host"] = host
-
-    # Temperature: None or an invalid value keeps the .env setting.
-    temperature = overrides.get("temperature")
-    if temperature is not None:
-        result["temperature"] = _to_float(
-            temperature, result["temperature"], 0.0, 1.0)
-    return result
-
-
-def provider_status(settings):
-    """Return (ready, message). Message is empty when ready."""
-    provider = settings["provider"]
-    if provider == "none":
-        return True, ""
-    if provider in ("anthropic", "openai"):
-        if not settings[f"{provider}_key"]:
-            return False, f"No {provider} key set. Showing a pre-written line."
-    if provider == "ollama":
-        host = settings["ollama_host"]
-        if not host.startswith(("http://", "https://")):
-            return False, "Ollama host must start with http:// or https://."
-    if not settings[f"{provider}_model"]:
-        return False, f"No {provider} model set. Showing a pre-written line."
-    return True, ""
 
 
 # --- Prompt and cleaning -----------------------------------------------
@@ -194,17 +150,10 @@ def clean_text(raw):
         return None
     text = str(raw)
 
-    # Remove reasoning blocks some local models add.
-    text = re.sub(r"<think>.*?</think>", "", text,
-                  flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r"<think>.*", "", text, flags=re.DOTALL | re.IGNORECASE)
-    if "</think>" in text.lower():
-        text = re.split(r"</think>", text, flags=re.IGNORECASE)[-1]
-
     # Swap long dashes for commas, drop wrapping quotes, tidy spaces.
-    text = text.replace("\u2014", ", ").replace("\u2013", ", ")
+    text = re.sub(r"\s*[—–]\s*", ", ", text)
     text = " ".join(text.split())
-    text = text.strip("\"'\u201c\u201d\u2018\u2019 ").strip()
+    text = text.strip("\"'“”‘’ ").strip()
 
     if len(text) < MIN_LINE_CHARS or len(text) > MAX_LINE_CHARS:
         return None
@@ -213,144 +162,156 @@ def clean_text(raw):
     return text
 
 
-# --- Token usage -------------------------------------------------------
-# Each helper returns (tokens_sent, tokens_received). Missing data is 0.
+# --- Gemini call -------------------------------------------------------
 
-def _anthropic_usage(response):
-    usage = getattr(response, "usage", None)
-    return (_to_int(getattr(usage, "input_tokens", 0)),
-            _to_int(getattr(usage, "output_tokens", 0)))
+def _parse_gemini(data):
+    """Pull (text, tokens_sent, tokens_received) out of a Gemini reply.
 
+    Text is "" when Gemini blocked the prompt or stopped early (for
+    example it hit the token cap), so a cut-off line is never shown.
+    Thinking tokens are billed as output, so they are counted as received.
+    """
+    if not isinstance(data, dict):
+        return "", 0, 0
+    usage = data.get("usageMetadata") or {}
+    tokens_in = _to_int(usage.get("promptTokenCount"))
+    tokens_out = (_to_int(usage.get("candidatesTokenCount"))
+                  + _to_int(usage.get("thoughtsTokenCount")))
 
-def _openai_usage(response):
-    usage = getattr(response, "usage", None)
-    return (_to_int(getattr(usage, "prompt_tokens", 0)),
-            _to_int(getattr(usage, "completion_tokens", 0)))
+    candidates = data.get("candidates") or []
+    if not candidates:  # Prompt blocked: no candidates come back
+        return "", tokens_in, tokens_out
+    candidate = candidates[0]
+    if candidate.get("finishReason", "STOP") != "STOP":
+        return "", tokens_in, tokens_out
 
-
-def _ollama_usage(data):
-    return (_to_int(data.get("prompt_eval_count")),
-            _to_int(data.get("eval_count")))
-
-
-# --- Provider calls ----------------------------------------------------
-# Each returns (text, tokens_sent, tokens_received) or raises.
-# generate_reflection catches everything.
-
-def _call_anthropic(settings, user_message):
-    import anthropic
-    client = anthropic.Anthropic(
-        api_key=settings["anthropic_key"],
-        timeout=settings["timeout"],
-        max_retries=0,  # No automatic retries
-    )
-    response = client.messages.create(
-        model=settings["anthropic_model"],
-        max_tokens=MAX_TOKENS,
-        temperature=settings["temperature"],
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user_message}],
-    )
-    text = "".join(
-        block.text for block in response.content
-        if getattr(block, "type", "") == "text"
-    )
-    tokens_in, tokens_out = _anthropic_usage(response)
+    parts = (candidate.get("content") or {}).get("parts") or []
+    text = "".join(part.get("text", "") for part in parts
+                   if not part.get("thought"))
     return text, tokens_in, tokens_out
 
 
-def _call_openai(settings, user_message):
-    from openai import OpenAI
-    client = OpenAI(
-        api_key=settings["openai_key"],
-        timeout=settings["timeout"],
-        max_retries=0,  # No automatic retries
-    )
-    response = client.chat.completions.create(
-        model=settings["openai_model"],
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_message},
-        ],
-        temperature=settings["temperature"],
-        max_tokens=MAX_TOKENS,
-    )
-    text = response.choices[0].message.content or ""
-    tokens_in, tokens_out = _openai_usage(response)
-    return text, tokens_in, tokens_out
-
-
-def _call_ollama(settings, user_message):
-    import requests
-    host = settings["ollama_host"].rstrip("/")
-    response = requests.post(
-        f"{host}/api/chat",
-        json={
-            "model": settings["ollama_model"],
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                # /no_think asks Qwen3 models to skip their reasoning text.
-                {"role": "user", "content": user_message + " /no_think"},
-            ],
-            "stream": False,
-            "options": {
-                "temperature": settings["temperature"],
-                "num_predict": 300,
-            },
+def _call_gemini(settings, user_message):
+    """Returns (text, tokens_sent, tokens_received) or raises."""
+    body = json.dumps({
+        "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+        "contents": [{"role": "user", "parts": [{"text": user_message}]}],
+        "generationConfig": {
+            "temperature": settings["temperature"],
+            "maxOutputTokens": MAX_OUTPUT_TOKENS,
         },
-        timeout=settings["timeout"],
+    }).encode("utf-8")
+    request = urllib.request.Request(
+        GEMINI_URL.format(model=settings["model"]),
+        data=body,
+        # The key goes in a header, not the URL, so it cannot end up in a log line.
+        headers={"Content-Type": "application/json",
+                 "x-goog-api-key": settings["gemini_key"]},
+        method="POST",
     )
-    response.raise_for_status()
-    data = response.json()
-    text = data.get("message", {}).get("content", "")
-    tokens_in, tokens_out = _ollama_usage(data)
-    return text, tokens_in, tokens_out
+    # No automatic retries: one click makes at most one API call.
+    with urllib.request.urlopen(request, timeout=settings["timeout"]) as response:
+        data = json.loads(response.read().decode("utf-8"))
+    return _parse_gemini(data)
 
 
-# --- Main entry point --------------------------------------------------
+def _failure_note(exc):
+    """Short, safe reason for a fallback. Never the message or the key."""
+    if isinstance(exc, urllib.error.HTTPError):
+        if exc.code == 429:
+            return ("Gemini's free limit has been reached for now. "
+                    "Showing a pre-written line.")
+        return f"Gemini call failed (HTTP {exc.code}). Showing a pre-written line."
+    return f"Gemini call failed ({type(exc).__name__}). Showing a pre-written line."
+
+
+# --- Main entry points -------------------------------------------------
 
 def generate_reflection(band, direction, values, settings, avoid=None):
-    """Return a Reflection. Falls back to the bank on any problem."""
-    provider = settings["provider"]
+    """Return a Reflection. Falls back to the bank on any problem.
 
-    if provider == "none":
+    With no Gemini key the bank is used and no note is added: that is the
+    normal "pre-written lines only" mode.
+    """
+    if not settings["gemini_key"]:
         return Reflection(get_response(band, avoid), "bank", "")
-
-    ready, message = provider_status(settings)
-    if not ready:
-        return Reflection(get_response(band, avoid), "bank", message)
 
     # Set before the call so a rejected reply still reports its usage.
     tokens_in = 0
     tokens_out = 0
     try:
         user_message = build_user_message(band, direction, values)
-        if provider == "anthropic":
-            raw, tokens_in, tokens_out = _call_anthropic(settings, user_message)
-        elif provider == "openai":
-            raw, tokens_in, tokens_out = _call_openai(settings, user_message)
-        else:
-            raw, tokens_in, tokens_out = _call_ollama(settings, user_message)
-
+        raw, tokens_in, tokens_out = _call_gemini(settings, user_message)
         text = clean_text(raw)
         if text is None:
             raise ValueError("unusable reply")
-        return Reflection(text, provider, "", tokens_in, tokens_out)
+        return Reflection(text, "gemini", "", tokens_in, tokens_out)
     except Exception as exc:  # Deliberately broad: any failure falls back
-        # Only the error type is shown. Never the message or the key.
-        note = (f"{provider} call failed ({type(exc).__name__}). "
-                "Showing a pre-written line.")
-        return Reflection(get_response(band, avoid), "bank", note,
-                          tokens_in, tokens_out)
+        return Reflection(get_response(band, avoid), "bank",
+                          _failure_note(exc), tokens_in, tokens_out)
+
+
+def _parse_values(raw):
+    """Validate the slider values from a request. None if they are bad."""
+    if not isinstance(raw, dict):
+        return None
+    values = {}
+    for slider in SLIDERS:
+        value = raw.get(slider["key"])
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        if not math.isfinite(value):
+            return None
+        values[slider["key"]] = clamp(value)
+    return values
+
+
+def handle_reflect(raw_body, env=None):
+    """Turn a request body (bytes) into (http_status, json_payload).
+
+    Never raises. The band and direction are worked out here, not taken
+    from the browser, so the browser cannot ask for anything else.
+    """
+    if len(raw_body) > MAX_BODY_BYTES:
+        return 413, {"error": "Request too large."}
+    try:
+        data = json.loads(raw_body or b"{}")
+    except ValueError:  # Includes bad JSON and bad UTF-8
+        return 400, {"error": "Request body must be JSON."}
+    if not isinstance(data, dict):
+        return 400, {"error": "Request body must be a JSON object."}
+
+    values = _parse_values(data.get("values"))
+    if values is None:
+        return 400, {"error": "Send a number from 0 to 10 for each slider."}
+
+    settings = load_settings(env)
+    if not isinstance(data.get("temperature"), bool):
+        settings["temperature"] = _to_float(
+            data.get("temperature"), settings["temperature"], 0.0, 1.0)
+    avoid = data.get("avoid")
+    avoid = avoid[:MAX_AVOID_CHARS] if isinstance(avoid, str) else None
+
+    band = get_band(compute_score(values))
+    result = generate_reflection(
+        band, get_direction(band), values, settings, avoid)
+    return 200, {
+        "text": result.text,
+        "source": result.source,
+        "note": result.note,
+        "band": band,
+        "input_tokens": result.input_tokens,
+        "output_tokens": result.output_tokens,
+    }
 
 
 # --- Self-check --------------------------------------------------------
 # Run with:  python api_client.py
-# Makes no real API calls. One test tries an unreachable local address.
+# Makes no real API calls. Gemini is replaced with fakes.
 
 def _run_checks():
+    import io
     import sys
-    from types import SimpleNamespace
 
     from mood_logic import default_values
     from responses import RESPONSE_BANK
@@ -358,52 +319,24 @@ def _run_checks():
     this = sys.modules[__name__]
     bank_lines = [line for lines in RESPONSE_BANK.values() for line in lines]
 
-    # Settings: defaults, bad provider, placeholder key, clamping.
+    # Settings: defaults, placeholder key, bad model, clamping.
     settings = load_settings(env={})
-    assert settings["provider"] == "none"
-    assert settings["ollama_model"] == "qwen3:4b"
+    assert settings["gemini_key"] == ""
+    assert settings["model"] == DEFAULT_MODEL
     assert settings["temperature"] == DEFAULT_TEMPERATURE
-    assert load_settings(env={"MOOD_PROVIDER": "banana"})["provider"] == "none"
-    env = {"MOOD_PROVIDER": "anthropic",
-           "ANTHROPIC_API_KEY": "your-anthropic-key-here"}
-    assert load_settings(env=env)["anthropic_key"] == ""
-    env = {"MOOD_TEMPERATURE": "9", "MOOD_TIMEOUT_SECONDS": "abc"}
-    loaded = load_settings(env=env)
+    assert settings["timeout"] == DEFAULT_TIMEOUT
+    assert load_settings(env={"GEMINI_API_KEY": "your-gemini-key-here"})["gemini_key"] == ""
+    assert load_settings(env={"GEMINI_API_KEY": " abc "})["gemini_key"] == "abc"
+    assert load_settings(env={"GEMINI_MODEL": "models/gemini-x"})["model"] == "gemini-x"
+    assert load_settings(env={"GEMINI_MODEL": "a/b?key=1"})["model"] == DEFAULT_MODEL
+    loaded = load_settings(env={"MOOD_TEMPERATURE": "9", "MOOD_TIMEOUT_SECONDS": "abc"})
     assert loaded["temperature"] == 1.0 and loaded["timeout"] == DEFAULT_TIMEOUT
+    assert load_settings(env={"MOOD_TIMEOUT_SECONDS": "999"})["timeout"] == 25.0
+    assert load_settings(env={"MOOD_TEMPERATURE": "nan"})["temperature"] == DEFAULT_TEMPERATURE
 
     # Whole-number helper.
     assert _to_int(None) == 0 and _to_int("abc") == 0 and _to_int(-5) == 0
     assert _to_int(7) == 7 and _to_int(7.9) == 7 and _to_int("12") == 12
-
-    # Overrides: applied to a copy, never to the environment.
-    before = dict(os.environ)
-    changed = apply_overrides(settings, {
-        "provider": "openai", "api_key": "sk-test-not-real",
-        "model": "some-model"})
-    assert changed["provider"] == "openai"
-    assert changed["openai_key"] == "sk-test-not-real"
-    assert changed["openai_model"] == "some-model"
-    assert settings["provider"] == "none"          # original untouched
-    assert dict(os.environ) == before              # environment untouched
-    assert apply_overrides(settings, {"provider": ""})["provider"] == "none"
-
-    # Temperature override: applied, clamped, and ignored when blank or bad.
-    assert apply_overrides(settings, {"temperature": 0.2})["temperature"] == 0.2
-    assert apply_overrides(settings, {"temperature": 5})["temperature"] == 1.0
-    assert apply_overrides(settings, {"temperature": -1})["temperature"] == 0.0
-    assert apply_overrides(settings, {"temperature": None})["temperature"] \
-        == settings["temperature"]
-    assert apply_overrides(settings, {"temperature": "abc"})["temperature"] \
-        == settings["temperature"]
-    assert settings["temperature"] == DEFAULT_TEMPERATURE  # original untouched
-    assert dict(os.environ) == before
-
-    # Status checks.
-    assert provider_status(settings) == (True, "")
-    assert provider_status({**settings, "provider": "openai"})[0] is False
-    assert provider_status({**settings, "provider": "ollama",
-                            "ollama_host": "localhost"})[0] is False
-    assert provider_status({**settings, "provider": "ollama"})[0] is True
 
     # Prompt message has no digits.
     extremes = {"energy": 0, "spirits": 10, "calm": 2, "control": 8}
@@ -417,107 +350,152 @@ def _run_checks():
     assert clean_text("Take 10 minutes to rest today.") is None
     assert clean_text("x" * 400) is None
     assert clean_text('"A quiet minute helps."') == "A quiet minute helps."
-    assert clean_text("<think>plan it</think>A quiet minute helps.") \
-        == "A quiet minute helps."
-    assert clean_text("<think>never closed") is None
-    assert clean_text("Slow down \u2014 breathe.") == "Slow down , breathe."
+    assert clean_text("Slow down — breathe.") == "Slow down, breathe."
+    assert clean_text("Slow down–breathe.") == "Slow down, breathe."
     assert clean_text("Line one.\n\nLine two.") == "Line one. Line two."
 
-    # Token usage helpers, with fake replies. Missing data gives 0.
-    fake = SimpleNamespace(usage=SimpleNamespace(input_tokens=12, output_tokens=7))
-    assert _anthropic_usage(fake) == (12, 7)
-    assert _anthropic_usage(SimpleNamespace()) == (0, 0)
-    fake = SimpleNamespace(
-        usage=SimpleNamespace(prompt_tokens=30, completion_tokens=9))
-    assert _openai_usage(fake) == (30, 9)
-    assert _openai_usage(SimpleNamespace(usage=None)) == (0, 0)
-    assert _ollama_usage({"prompt_eval_count": 40, "eval_count": 15}) == (40, 15)
-    assert _ollama_usage({}) == (0, 0)
+    # Parsing a Gemini reply: text, tokens (thinking counted as received).
+    good = {
+        "candidates": [{"finishReason": "STOP", "content": {"parts": [
+            {"text": "A quiet minute "}, {"text": "helps."}]}}],
+        "usageMetadata": {"promptTokenCount": 30, "candidatesTokenCount": 8,
+                          "thoughtsTokenCount": 5},
+    }
+    assert _parse_gemini(good) == ("A quiet minute helps.", 30, 13)
+    cut = {"candidates": [{"finishReason": "MAX_TOKENS", "content": {"parts": [
+        {"text": "A quiet mi"}]}}], "usageMetadata": {"promptTokenCount": 30}}
+    assert _parse_gemini(cut) == ("", 30, 0)
+    blocked = {"promptFeedback": {"blockReason": "SAFETY"},
+               "usageMetadata": {"promptTokenCount": 30}}
+    assert _parse_gemini(blocked) == ("", 30, 0)
+    safety = {"candidates": [{"finishReason": "SAFETY"}]}
+    assert _parse_gemini(safety) == ("", 0, 0)
+    thoughts = {"candidates": [{"content": {"parts": [
+        {"text": "plan it", "thought": True}, {"text": "Fine."}]}}]}
+    assert _parse_gemini(thoughts)[0] == "Fine."
+    assert _parse_gemini(None) == ("", 0, 0) and _parse_gemini({}) == ("", 0, 0)
 
-    # Provider none: bank line, no note, no tokens.
+    # No key: bank line, no note, no tokens.
     result = generate_reflection("low", "lift", default_values(), settings)
     assert result.source == "bank" and result.note == ""
     assert result.text in RESPONSE_BANK["low"]
     assert (result.input_tokens, result.output_tokens) == (0, 0)
 
-    # Missing key: falls back with a note and no tokens.
-    result = generate_reflection(
-        "high", "settle", default_values(), {**settings, "provider": "anthropic"})
-    assert result.source == "bank" and result.note
-    assert result.text in RESPONSE_BANK["high"]
-    assert (result.input_tokens, result.output_tokens) == (0, 0)
-
-    # Mocked provider calls. Originals are restored afterwards.
-    originals = (this._call_anthropic, this._call_openai, this._call_ollama)
+    # The real request, with urlopen replaced: key in the header only.
+    originals = (this._call_gemini, urllib.request.urlopen)
+    keyed = {**settings, "gemini_key": "AIza-test-not-real"}
     try:
-        keyed = {**settings, "provider": "anthropic",
-                 "anthropic_key": "sk-test-not-real"}
+        sent = {}
 
-        # Good reply: text and tokens come through. Temperature is passed on.
-        seen = {}
-
-        def fake_anthropic(s, m):
-            seen["temperature"] = s["temperature"]
-            return "A quiet minute helps.", 12, 7
-        this._call_anthropic = fake_anthropic
+        def fake_urlopen(request, timeout=None):
+            sent["url"] = request.full_url
+            sent["headers"] = {k.lower(): v for k, v in request.header_items()}
+            sent["body"] = json.loads(request.data)
+            sent["timeout"] = timeout
+            return io.BytesIO(json.dumps(good).encode("utf-8"))
+        urllib.request.urlopen = fake_urlopen
         result = generate_reflection(
             "high", "settle", default_values(), {**keyed, "temperature": 0.2})
-        assert result.source == "anthropic"
-        assert result.text == "A quiet minute helps."
-        assert (result.input_tokens, result.output_tokens) == (12, 7)
-        assert seen["temperature"] == 0.2
+        assert result == Reflection("A quiet minute helps.", "gemini", "", 30, 13)
+        assert sent["url"] == GEMINI_URL.format(model=DEFAULT_MODEL)
+        assert "AIza" not in sent["url"]
+        assert sent["headers"]["x-goog-api-key"] == "AIza-test-not-real"
+        assert sent["body"]["generationConfig"]["temperature"] == 0.2
+        assert sent["body"]["generationConfig"]["maxOutputTokens"] == MAX_OUTPUT_TOKENS
+        assert sent["body"]["systemInstruction"]["parts"][0]["text"] == SYSTEM_PROMPT
+        user_text = sent["body"]["contents"][0]["parts"][0]["text"]
+        assert "Band: high." in user_text
+        assert sent["timeout"] == keyed["timeout"]
 
-        # Error: falls back, key never in the note, no tokens.
-        def boom(s, m):
-            raise RuntimeError("secret sk-test-not-real leaked?")
-        this._call_anthropic = boom
+        # Rate limit: friendly note, no key, no tokens.
+        def limited(request, timeout=None):
+            raise urllib.error.HTTPError(request.full_url, 429, "Too Many", {}, None)
+        urllib.request.urlopen = limited
         result = generate_reflection("high", "settle", default_values(), keyed)
         assert result.source == "bank" and result.text in bank_lines
-        assert "sk-test" not in result.note     # key never in the note
-        assert "RuntimeError" in result.note
+        assert "free limit" in result.note and "AIza" not in result.note
         assert (result.input_tokens, result.output_tokens) == (0, 0)
 
-        # Digits in the reply: rejected, but the tokens were still used.
-        this._call_anthropic = lambda s, m: ("Rest for 10 minutes.", 20, 9)
+        # Other HTTP error: code shown, nothing else.
+        def forbidden(request, timeout=None):
+            raise urllib.error.HTTPError(request.full_url, 403, "Forbidden", {}, None)
+        urllib.request.urlopen = forbidden
         result = generate_reflection("high", "settle", default_values(), keyed)
-        assert result.source == "bank"
-        assert (result.input_tokens, result.output_tokens) == (20, 9)
+        assert "HTTP 403" in result.note and "AIza" not in result.note
 
-        # Empty reply: rejected, tokens still counted.
-        this._call_anthropic = lambda s, m: ("", 15, 0)
+        # Network failure: only the error type is shown.
+        def down(request, timeout=None):
+            raise urllib.error.URLError("secret AIza-test-not-real leaked?")
+        urllib.request.urlopen = down
         result = generate_reflection("high", "settle", default_values(), keyed)
-        assert result.source == "bank"
-        assert (result.input_tokens, result.output_tokens) == (15, 0)
-
-        # OpenAI.
-        this._call_openai = lambda s, m: ("Something lovely is close by.", 30, 9)
-        result = generate_reflection(
-            "low", "lift", default_values(),
-            {**settings, "provider": "openai", "openai_key": "sk-test-not-real"})
-        assert result.source == "openai"
-        assert (result.input_tokens, result.output_tokens) == (30, 9)
-
-        # Ollama: reasoning text stripped, and /no_think added.
-        seen_message = {}
-
-        def fake_ollama(s, m):
-            seen_message["text"] = m
-            return "<think>hm</think>Let things settle for a while.", 40, 15
-        this._call_ollama = fake_ollama
-        result = generate_reflection(
-            "high", "settle", default_values(), {**settings, "provider": "ollama"})
-        assert result.source == "ollama"
-        assert result.text == "Let things settle for a while."
-        assert (result.input_tokens, result.output_tokens) == (40, 15)
+        assert result.source == "bank" and "URLError" in result.note
+        assert "AIza" not in result.note and "secret" not in result.note
     finally:
-        this._call_anthropic, this._call_openai, this._call_ollama = originals
+        this._call_gemini, urllib.request.urlopen = originals
 
-    # Real call to an unreachable local address: must fall back cleanly.
-    unreachable = {**settings, "provider": "ollama",
-                   "ollama_host": "http://127.0.0.1:9", "timeout": 3.0}
-    result = generate_reflection("low", "lift", default_values(), unreachable)
-    assert result.source == "bank" and result.note
-    assert (result.input_tokens, result.output_tokens) == (0, 0)
+    # Mocked _call_gemini: unusable replies fall back but keep their tokens.
+    try:
+        this._call_gemini = lambda s, m: ("Rest for 10 minutes.", 20, 9)
+        result = generate_reflection("high", "settle", default_values(), keyed)
+        assert result.source == "bank" and (result.input_tokens, result.output_tokens) == (20, 9)
+        this._call_gemini = lambda s, m: ("", 15, 0)
+        result = generate_reflection("high", "settle", default_values(), keyed)
+        assert result.source == "bank" and (result.input_tokens, result.output_tokens) == (15, 0)
+
+        # handle_reflect: validation.
+        ok_values = {"energy": 5, "spirits": 5, "calm": 5, "control": 5}
+        post = lambda payload, env=None: handle_reflect(  # noqa: E731
+            payload if isinstance(payload, bytes) else json.dumps(payload).encode(), env)
+        assert post(b"not json")[0] == 400
+        assert post(b"\xff\xfe")[0] == 400
+        assert post(b"[1]")[0] == 400
+        assert post(b"x" * (MAX_BODY_BYTES + 1))[0] == 413
+        assert post({})[0] == 400
+        assert post({"values": {"energy": 5}})[0] == 400
+        assert post({"values": {**ok_values, "calm": "5"}})[0] == 400
+        assert post({"values": {**ok_values, "calm": True}})[0] == 400
+        assert post(b'{"values": {"energy": NaN, "spirits": 5, "calm": 5, "control": 5}}')[0] == 400
+        assert post(b'{"values": {"energy": 1e999, "spirits": 5, "calm": 5, "control": 5}}')[0] == 400
+
+        # handle_reflect: good request with no key uses the bank.
+        status, payload = post({"values": ok_values}, env={})
+        assert status == 200 and payload["band"] == "balanced"
+        assert payload["source"] == "bank" and payload["text"] in RESPONSE_BANK["balanced"]
+        assert payload["note"] == "" and payload["input_tokens"] == 0
+
+        # handle_reflect: out-of-range numbers are clamped, band is server-side.
+        status, payload = post({"values": {k: 99 for k in ok_values}}, env={})
+        assert status == 200 and payload["band"] == "very_high"
+
+        # handle_reflect: key set, temperature passed through and clamped,
+        # a bad temperature or "avoid" is ignored.
+        seen = {}
+
+        def fake_gemini(s, m):
+            seen["temperature"] = s["temperature"]
+            seen["message"] = m
+            return "Something lovely is close by.", 30, 9
+        this._call_gemini = fake_gemini
+        env = {"GEMINI_API_KEY": "AIza-test-not-real"}
+        status, payload = post({"values": ok_values, "temperature": 0.2}, env)
+        assert payload["source"] == "gemini" and seen["temperature"] == 0.2
+        assert (payload["input_tokens"], payload["output_tokens"]) == (30, 9)
+        post({"values": ok_values, "temperature": 7}, env)
+        assert seen["temperature"] == 1.0
+        post({"values": ok_values, "temperature": "hot"}, env)
+        assert seen["temperature"] == DEFAULT_TEMPERATURE
+        post({"values": ok_values, "temperature": True}, env)
+        assert seen["temperature"] == DEFAULT_TEMPERATURE
+        status, payload = post({"values": ok_values, "avoid": 5}, {})
+        assert status == 200
+
+        # The prompt carries words only, even when the browser sends numbers.
+        assert not any(ch.isdigit() for ch in seen["message"]), seen["message"]
+
+        # Response never contains the key.
+        assert "AIza" not in json.dumps(payload)
+    finally:
+        this._call_gemini = originals[0]
 
     print("All checks passed.")
 

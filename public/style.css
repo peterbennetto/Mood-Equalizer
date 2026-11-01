@@ -1,0 +1,192 @@
+:root {
+  --bg: #14181F;
+  --panel: #1E2530;
+  --track: #2A3242;
+  --text: #E6E9EE;
+  --primary: #7FB5A8;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  line-height: 1.5;
+}
+
+main {
+  max-width: 700px;
+  margin: 0 auto;
+  padding: 32px 16px 64px;
+}
+
+h1 { margin: 0 0 8px; font-size: 2.2rem; line-height: 1.2; }
+h2 { margin: 24px 0 4px; font-size: 1rem; }
+
+.caption {
+  margin: 0 0 6px;
+  font-size: 0.9rem;
+  opacity: 0.75;
+}
+
+/* --- Gauge ------------------------------------------------------------ */
+
+.gauge-track {
+  position: relative;
+  height: 14px;
+  border-radius: 7px;
+  background: var(--track);
+  margin: 30px 0 8px;
+}
+.gauge-fill {
+  position: absolute;
+  top: 0;
+  height: 14px;
+  border-radius: 7px;
+  opacity: 0.85;
+}
+.gauge-centre {
+  position: absolute;
+  left: 50%;
+  top: -5px;
+  width: 2px;
+  height: 24px;
+  background: var(--text);
+  opacity: 0.5;
+}
+.gauge-marker {
+  position: absolute;
+  top: 50%;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: 3px solid var(--bg);
+  transform: translate(-50%, -50%);
+}
+.gauge-labels {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  font-size: 0.8rem;
+  opacity: 0.75;
+  margin-bottom: 22px;
+}
+.gauge-labels .mid { text-align: center; }
+.gauge-labels .end { text-align: right; }
+
+@media (prefers-reduced-motion: no-preference) {
+  .gauge-marker, .gauge-fill { transition: left 0.15s, width 0.15s, background 0.15s; }
+}
+
+/* --- Mood sliders ----------------------------------------------------- */
+/* No numbers are shown. The end labels and colour strip are the guide. */
+
+.mood-slider { margin-bottom: 4px; }
+.mood-slider label { display: block; font-size: 0.95rem; }
+.mood-strip {
+  height: 5px;
+  border-radius: 3px;
+  margin: 0 0 4px;
+}
+.mood-ends {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.8rem;
+  opacity: 0.75;
+  margin-bottom: 18px;
+}
+
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  display: block;
+  width: 100%;
+  height: 28px;
+  margin: 0;
+  background: transparent;
+  cursor: pointer;
+}
+input[type="range"]::-webkit-slider-runnable-track {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--track);
+}
+input[type="range"]::-moz-range-track {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--track);
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 20px;
+  height: 20px;
+  margin-top: -7px;
+  border-radius: 50%;
+  border: 3px solid var(--bg);
+  background: var(--primary);
+}
+input[type="range"]::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 3px solid var(--bg);
+  background: var(--primary);
+}
+input[type="range"]:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* --- Button, reflection, feedback ------------------------------------- */
+
+button { font: inherit; color: inherit; cursor: pointer; }
+button:focus-visible, summary:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
+button.primary {
+  background: var(--primary);
+  color: var(--bg);
+  border: 0;
+  border-radius: 8px;
+  padding: 10px 22px;
+  font-weight: 600;
+}
+button.primary:disabled { opacity: 0.6; cursor: progress; }
+
+#status { min-height: 1.4em; margin-top: 8px; }
+
+.reflection {
+  background: var(--panel);
+  border-left: 4px solid var(--primary);
+  border-radius: 6px;
+  padding: 16px 18px;
+  margin: 14px 0 6px;
+  font-size: 1.1rem;
+  line-height: 1.5;
+}
+
+.thumbs { display: flex; gap: 8px; margin-top: 4px; }
+.thumb {
+  background: var(--panel);
+  border: 1px solid var(--track);
+  border-radius: 8px;
+  padding: 6px 14px;
+  font-size: 1.1rem;
+}
+.thumb:hover { border-color: var(--primary); }
+
+/* --- Settings --------------------------------------------------------- */
+
+.settings {
+  margin-top: 36px;
+  padding-top: 16px;
+  border-top: 1px solid var(--track);
+}
+.settings summary { cursor: pointer; font-weight: 600; }
+.settings-body { margin-top: 12px; }
+
+[hidden] { display: none !important; }
